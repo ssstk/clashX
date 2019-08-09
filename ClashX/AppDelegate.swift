@@ -81,7 +81,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // check config vaild via api
         ConfigFileManager.checkFinalRuleAndShowAlert()
         
-        RemoteConfigManager.updateCheckAtLaunch()
+        // start watch config file change
+        ConfigFileManager.shared.watchConfigFile(configName: ConfigManager.selectConfigName)
+        
+        RemoteConfigManager.shared.autoUpdateCheck()
         
     }
 
@@ -92,14 +95,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             _ = ProxyConfigHelperManager.setUpSystemProxy(port: nil,socksPort: nil)
         }
     }
+    
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let url = urls.first else {return}
+        
+        guard let components = URLComponents(string: url.absoluteString),
+            let scheme = components.scheme,
+            scheme.hasPrefix("clash"),
+            let host = components.host
+            else {return}
+        
+        if host == "install-config" {
+            guard let url = components.queryItems?.first(where: { item in
+                item.name == "url"
+            })?.value else {return}
+            
+            remoteConfigAutoupdateMenuItem.menu?.performActionForItem(at: 0)
+            
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                NotificationCenter.default.post(name: Notification.Name(rawValue: "didGetUrl"), object: nil, userInfo: ["url":url])
+            }
+            
+        } else {
+            Logger.log(msg: "Unknown url host:\(components.path)")
+        }
+
+    }
 
     func setupData() {
         
         // check and refresh api url
         _ = ConfigManager.apiUrl
         
-        // start watch config file change
-        ConfigFileManager.shared.watchConfigFile(configName: ConfigManager.selectConfigName)
         remoteConfigAutoupdateMenuItem.state = RemoteConfigManager.autoUpdateEnable ? .on : .off
         
         NotificationCenter.default.rx.notification(kShouldUpDateConfig).bind {
@@ -148,7 +175,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 case .rule:self.proxyModeRuleMenuItem.state = .on
                 }
                 self.allowFromLanMenuItem.state = config.allowLan ? .on : .off
-                self.proxyModeMenuItem.title = "\("Proxy Mode".localized()) (\(config.mode.rawValue.localized()))"
+                
+                self.proxyModeMenuItem.title = "\(NSLocalizedString("Proxy Mode", comment: "")) (\(config.mode.name))"
                 
                 self.updateProxyList()
                 
@@ -245,7 +273,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             setUIPath(buffer)
         }
         
-        print("Trying start proxy")
+        Logger.log(msg: "Trying start proxy")
         if let cstring = run() {
             let error = String(cString: cstring)
             if (error != "success") {
@@ -345,7 +373,7 @@ extension AppDelegate {
         pasteboard.clearContents()
         let port = ConfigManager.shared.currentConfig?.port ?? 0
         let socksport = ConfigManager.shared.currentConfig?.socketPort ?? 0
-        pasteboard.setString("export https_proxy=http://127.0.0.1:\(port);export http_proxy=http://127.0.0.1:\(port);export all_proxy=socks5://127.0.0.1:\(socksport)", forType: .string)
+        pasteboard.setString("export https_proxy=http://127.0.0.1:\(port);export http_proxy=http://127.0.0.1:\(port);export all_proxy=socks5h://127.0.0.1:\(socksport)", forType: .string)
     }
     
     @IBAction func actionSpeedTest(_ sender: Any) {
@@ -411,13 +439,15 @@ extension AppDelegate {
                 if notifaction{
                     NSUserNotificationCenter
                         .default
-                        .post(title: "Reload Config Succeed", info: "Succees")
+                        .post(title: NSLocalizedString("Reload Config Succeed", comment: ""),
+                              info: NSLocalizedString("Succees", comment: ""))
                 }
             } else {
                 if (notifaction) {
                     NSUserNotificationCenter
                         .default
-                        .post(title: "Reload Config Fail", info: error ?? "")
+                        .post(title: NSLocalizedString("Reload Config Fail", comment: ""),
+                              info: error ?? "")
                 }
             }
             
@@ -437,13 +467,9 @@ extension AppDelegate {
         remoteConfigAutoupdateMenuItem.state = RemoteConfigManager.autoUpdateEnable ? .on : .off
     }
     
-    @IBAction func actionSetRemoteConfigUrl(_ sender: Any) {
-        RemoteConfigManager.showUrlInputAlert()
-    }
-    
     
     @IBAction func actionUpdateRemoteConfig(_ sender: Any) {
-        RemoteConfigManager.updateConfigIfNeed()
+        RemoteConfigManager.shared.updateCheck(ignoreTimeLimit: true)
     }
 }
 

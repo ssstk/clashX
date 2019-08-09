@@ -10,30 +10,55 @@ import Cocoa
 import Alamofire
 import Yams
 
-class RemoteConfigManager: NSObject {
-    static var configUrl:String? {
-        get {
-            return UserDefaults.standard.string(forKey: "kRemoteConfigUrl")
+class RemoteConfigManager {
+    
+    var configs: [RemoteConfigModel] = []
+    var autoUpateTimer: Timer?
+    
+    static let shared = RemoteConfigManager()
+
+    private init(){
+        if let savedConfigs = UserDefaults.standard.object(forKey: "kRemoteConfigs") as? Data {
+            let decoder = JSONDecoder()
+            if let loadedConfig = try? decoder.decode([RemoteConfigModel].self, from: savedConfigs) {
+                configs = loadedConfig
+            } else {
+                assertionFailure()
+            }
         }
-        
-        set {
-            UserDefaults.standard.set(newValue, forKey: "kRemoteConfigUrl")
+        migrateOldRemoteConfig()
+        setupAutoUpdateTimer()
+    }
+    
+    func saveConfigs() {
+        Logger.log(msg: "Saving Remote Config Setting")
+        let encoder = JSONEncoder()
+        if let encoded = try? encoder.encode(configs) {
+             UserDefaults.standard.set(encoded, forKey: "kRemoteConfigs")
         }
     }
     
-    static var configFileName:String? {
-        guard let configUrl = configUrl else {return nil}
-        return URL(string: configUrl)?.host
+    func migrateOldRemoteConfig() {
+        if let url = UserDefaults.standard.string(forKey: "kRemoteConfigUrl"),
+            let name = URL(string: url)?.host{
+            configs.append(RemoteConfigModel(url: url, name: name))
+            UserDefaults.standard.removeObject(forKey: "kRemoteConfigUrl")
+            saveConfigs()
+        }
     }
     
-    static var lastAutoCheckTime:Date? {
-        get {
-            return UserDefaults.standard.object(forKey: "kLastAutoCheckTime") as? Date
+    func setupAutoUpdateTimer() {
+        autoUpateTimer?.invalidate()
+        autoUpateTimer = nil
+        guard RemoteConfigManager.autoUpdateEnable else {
+            Logger.log(msg: "autoUpdateEnable did not enable,autoUpateTimer invalidated.")
+            return
         }
-        set {
-            UserDefaults.standard.set(newValue, forKey: "kLastAutoCheckTime")
-        }
+        Logger.log(msg: "set up autoUpateTimer")
+        let timeInterval: TimeInterval = 60 * 60 * 3 // Three hour
+        autoUpateTimer = Timer.scheduledTimer(timeInterval: timeInterval, target: self, selector: #selector(autoUpdateCheck), userInfo: nil, repeats: true)
     }
+    
     
     static var autoUpdateEnable:Bool {
         get {
@@ -41,119 +66,124 @@ class RemoteConfigManager: NSObject {
         }
         set {
             UserDefaults.standard.set(newValue, forKey: "kAutoUpdateEnable")
+            RemoteConfigManager.shared.setupAutoUpdateTimer()
         }
     }
     
-    static func showUrlInputAlert() {
-        let msg = NSAlert()
-        msg.addButton(withTitle: "OK")
-        msg.addButton(withTitle: "Cancel")  // 2nd button
-        msg.messageText = "Remote config"
-        msg.informativeText = "url:"
-        
-        let txt = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
-        txt.cell?.usesSingleLineMode = true
-        txt.stringValue = configUrl ?? ""
-        msg.accessoryView = txt
-        let response = msg.runModal()
-        
-        if response == .alertFirstButtonReturn {
-            if txt.stringValue.count == 0 {
-                configUrl = nil
-                return
-            }
-            
-            if URL(string: txt.stringValue) != nil{
-                configUrl = txt.stringValue
-                updateConfigIfNeed()
-            } else {
-                alert(with: "Url Error")
-            }
-        }
+    @objc func autoUpdateCheck() {
+        guard RemoteConfigManager.autoUpdateEnable else {return}
+        Logger.log(msg: "Tigger config auto update check")
+        updateCheck()
     }
     
-    
-    static func updateCheckAtLaunch() {
-        guard autoUpdateEnable else {return}
-        let currentConfig = ConfigManager.selectConfigName
+    func updateCheck(ignoreTimeLimit: Bool = false) {
+        let currentConfigName = ConfigManager.selectConfigName
         
-        if RemoteConfigManager.configUrl != nil, configFileName == currentConfig {
+        let group = DispatchGroup()
+        
+        for config in configs {
+            if config.updating {continue}
+            // 12hour check
+            let timeLimitNoMantians = Date().timeIntervalSince(config.updateTime ?? Date(timeIntervalSince1970: 0)) < 60 * 60 * 12
             
-            if Date().timeIntervalSince(lastAutoCheckTime ?? Date(timeIntervalSince1970: 0)) < 60 * 60 * 12 {
-                // 12hour
-                return;
+            if timeLimitNoMantians && !ignoreTimeLimit {
+                Logger.log(msg: "[Auto Upgrade] Bypassing \(config.name) due to time check")
+                continue
             }
-            
-            lastAutoCheckTime = Date()
-            
-            RemoteConfigManager.updateConfigIfNeed { err in
-                if let err = err {
-                    NSUserNotificationCenter.default.post(title: "Remote Config Update Fail", info: err)
-                } else {
-                    NSUserNotificationCenter.default.post(title: "Remote Config Update", info: "Succeed!")
+            Logger.log(msg: "[Auto Upgrade] Requesting \(config.name)")
+            let isCurrentConfig = config.name == currentConfigName
+            config.updating = true
+            group.enter()
+            RemoteConfigManager.updateConfig(config: config) {
+                [weak config] error in
+                guard let config = config else {return}
+                
+                config.updating = false
+                group.leave()
+                if error == nil {
+                    config.updateTime = Date()
                 }
-            }
-        }
-    }
-    
-    static func getRemoteConfigString(handler:@escaping (String, String?)->()) {
-        guard let urlString = configUrl,
-            let fileName = configFileName
-            else {alert(with: "Not config url set!");return}
-        guard var urlRequest = try? URLRequest(url: urlString, method: .get) else {alert(with: "url incorrect");return}
-        urlRequest.cachePolicy = .reloadIgnoringCacheData
-        request(urlRequest).responseString(encoding: .utf8) { (res) in
-            if let s = res.result.value {
-                handler(fileName,s)
-            } else {
-                handler(fileName,nil)
-            }
-        }
-    }
-    
-    static func updateConfigIfNeed(complete:((String?)->())?=nil) {
-        getRemoteConfigString { (configName,string) in
-            guard let newConfigString = string else {
-                if let complete = complete {
-                    complete("Download fail")
-                } else {
-                    alert(with: "Download fail")
-                }
-                return
-            }
-            
-            let savePath = kConfigFolderPath.appending(configName).appending(".yaml")
-            let fm = FileManager.default
-            do {
-                if fm.fileExists(atPath: savePath) {
-                    let current = try String(contentsOfFile: savePath)
-                    if current == newConfigString {
-                        if let complete = complete {
-                            complete(nil)
-                        } else {
-                            self.alert(with: "No Update needed!")
-                        }
-                        return
+                
+                if isCurrentConfig {
+                    if let error = error {
+                        // Fail
+                        NSUserNotificationCenter.default
+                            .post(title: NSLocalizedString("Remote Config Update Fail", comment: ""),
+                                  info: error)
+                    } else {
+                        // Success
+                        NSUserNotificationCenter.default
+                            .post(title: NSLocalizedString("Remote Config Update", comment: "")
+                                , info: NSLocalizedString("Succeed!", comment: ""))
+                        NotificationCenter.default.post(Notification(name: kShouldUpDateConfig))
+                        RemoteConfigManager.didUpdateConfig()
                     }
-                    try fm.removeItem(atPath: savePath)
                 }
-                try newConfigString.write(toFile: savePath, atomically: true, encoding: .utf8)
-                ConfigManager.selectConfigName = configName
-                NotificationCenter.default.post(Notification(name: kShouldUpDateConfig))
-                if let complete = complete {
-                    complete(nil)
-                } else {
-                    self.alert(with: "Update Success!")
-                }
-                self.didUpdateConfig()
-            } catch let err {
-                if let complete = complete {
-                    complete(err.localizedDescription)
-                } else {
-                    self.alert(with: err.localizedDescription)
-                }
+                Logger.log(msg: "[Auto Upgrade] Finish \(config.name) result: \(error ?? "succeed")")
             }
         }
+        
+        group.notify(queue: .main) {
+            [weak self] in
+            self?.saveConfigs()
+        }
+    }
+    
+    
+    static func getRemoteConfigData(config: RemoteConfigModel, complete:@escaping ((Data?)->Void)) {
+        guard var urlRequest = try? URLRequest(url: config.url, method: .get) else {
+            assertionFailure()
+            Logger.log(msg: "[getRemoteConfigData] url incorrect,\(config.name) \(config.url)")
+            return
+        }
+        urlRequest.cachePolicy = .reloadIgnoringCacheData
+
+        request(urlRequest).responseData { res in
+            complete(res.result.value)
+        }
+    }
+    
+    static func updateConfig(config: RemoteConfigModel, complete:((String?)->())?=nil) {
+        getRemoteConfigData(config: config) { data in
+            guard let newData = data else {
+                complete?(NSLocalizedString("Download fail", comment: "") )
+                return
+            }
+            guard let newConfigString = String(data: newData, encoding: .utf8),
+                verifyConfig(string: newConfigString) else {
+                complete?(NSLocalizedString("Remote Config Format Error", comment: ""))
+                return
+            }
+            let savePath = kConfigFolderPath.appending(config.name).appending(".yaml")
+
+            if config.name == ConfigManager.selectConfigName {
+                ConfigFileManager.shared.pauseForNextChange()
+            }
+            
+            do {
+                if FileManager.default.fileExists(atPath: savePath) {
+                    try FileManager.default.removeItem(atPath: savePath)
+                }
+                try newData.write(to: URL(fileURLWithPath: savePath))
+                complete?(nil)
+            } catch let err {
+                complete?(err.localizedDescription)
+            }
+        }
+        
+    }
+    
+    static func verifyConfig(string: String) -> Bool {
+        do {
+            let yaml = try Yams.load(yaml: string) as? [String: Any]
+            if let proxies = yaml?["Proxy"] as? [Any], proxies.count > 0 {
+                return true
+            }
+        } catch let error {
+            Logger.log(msg: error.localizedDescription)
+            return false
+        }
+        return false
     }
     
     static func didUpdateConfig() {
@@ -165,14 +195,5 @@ class RemoteConfigManager: NSObject {
         }
     }
     
-    static func alert(with text:String) {
-        let alert = NSAlert()
-        alert.messageText = text
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
-    }
 }
 
-
-extension String: Error {}

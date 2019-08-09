@@ -1,10 +1,8 @@
-source 'https://cdn.jsdelivr.net/cocoa/'
-
+source 'https://cdn.cocoapods.org/'
 target 'ClashX' do
   inhibit_all_warnings!
   use_frameworks!
   pod 'LetsMove'
-  pod 'Sparkle'
   pod 'Alamofire'
   pod 'SwiftyJSON'
   pod 'RxSwift'
